@@ -23,7 +23,7 @@ optional features, so your `Cargo.toml` could look like this:
 
 ```toml
 [dependencies]
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "tor"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -40,6 +40,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("{resp:#?}");
     Ok(())
+}
+```
+
+```rs,no_run
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = reqwest::ClientBuilder::tor(Default::default())
+        .await
+        .unwrap()
+        .use_rustls_tls()
+        .build()
+        .unwrap();
+
+    let res = client
+        .get("https://check.torproject.org")
+        .send()
+        .await
+        .unwrap();
+    println!("Status: {}", res.status());
+
+    let text = res.text().await.unwrap();
+    let is_tor = text.contains("Congratulations. This browser is configured to use Tor.");
+    println!("Is Tor: {is_tor}");
+    assert!(is_tor);
 }
 ```
 
