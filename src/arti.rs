@@ -16,8 +16,10 @@ use hyper_util::rt::TokioIo;
 use pin_project::pin_project;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tor_rtcompat::Runtime;
+use tor_rtcompat::{PreferredRuntime, Runtime};
 use tower_service::Service;
+
+use crate::{async_impl::client::HyperClient, error, Body};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 /// Are we doing TLS?
@@ -361,5 +363,34 @@ impl hyper::rt::Write for ArtiHttpConnection {
             #[cfg(feature = "default-tls")]
             MaybeHttpsStreamProj::NativeHttps(t) => t.project().inner.poll_write_vectored(cx, bufs),
         }
+    }
+}
+
+pub struct TorHyperClient(
+    pub hyper_util::client::legacy::Client<ArtiHttpConnector<PreferredRuntime>, Body>,
+);
+
+impl HyperClient for TorHyperClient {
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<(), crate::Error>> {
+        self.0.poll_ready(cx).map_err(error::request)
+    }
+
+    fn call(
+        &mut self,
+        req: hyper::Request<crate::async_impl::body::Body>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<http::Response<hyper::body::Incoming>, crate::Error>>
+                + Send
+                + Sync,
+        >,
+    > {
+        let fut = self.0.call(req);
+        let fut = async move { fut.await.map_err(crate::error::request) };
+        Box::pin(fut)
+    }
+
+    fn clone_box(&self) -> Box<dyn HyperClient> {
+        Box::new(Self(self.0.clone()))
     }
 }

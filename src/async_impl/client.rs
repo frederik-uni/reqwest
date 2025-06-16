@@ -108,14 +108,55 @@ enum HttpVersionPref {
 struct HyperService {
     #[cfg(feature = "cookies")]
     cookie_store: Option<Arc<dyn cookie::CookieStore>>,
-    hyper: HyperClient,
+    hyper: Box<dyn HyperClient>,
 }
 
-#[derive(Clone)]
-pub enum HyperClient {
-    #[cfg(feature = "tor")]
-    Tor(hyper_util::client::legacy::Client<ArtiHttpConnector<PreferredRuntime>, Body>),
-    NonTor(hyper_util::client::legacy::Client<Connector, Body>),
+pub struct NonTorHyperClient(hyper_util::client::legacy::Client<Connector, Body>);
+
+impl HyperClient for NonTorHyperClient {
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<(), crate::Error>> {
+        self.0.poll_ready(cx).map_err(error::request)
+    }
+
+    fn call(
+        &mut self,
+        req: hyper::Request<crate::async_impl::body::Body>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<http::Response<hyper::body::Incoming>, crate::Error>>
+                + Send
+                + Sync,
+        >,
+    > {
+        let fut = self.0.call(req);
+        let fut = async move { fut.await.map_err(crate::error::request) };
+        Box::pin(fut)
+    }
+
+    fn clone_box(&self) -> Box<dyn HyperClient> {
+        Box::new(Self(self.0.clone()))
+    }
+}
+
+impl Clone for Box<dyn HyperClient> {
+    fn clone(&self) -> Box<dyn HyperClient> {
+        self.clone_box()
+    }
+}
+
+pub(crate) trait HyperClient: Send + Sync {
+    fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> Poll<Result<(), crate::Error>>;
+    fn call(
+        &mut self,
+        req: hyper::Request<crate::async_impl::body::Body>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<http::Response<hyper::body::Incoming>, crate::Error>>
+                + Send
+                + Sync,
+        >,
+    >;
+    fn clone_box(&self) -> Box<dyn HyperClient>;
 }
 
 impl Service<hyper::Request<crate::async_impl::body::Body>> for HyperService {
@@ -124,26 +165,14 @@ impl Service<hyper::Request<crate::async_impl::body::Body>> for HyperService {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Sync>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        match &mut self.hyper {
-            #[cfg(feature = "tor")]
-            HyperClient::Tor(client) => client.poll_ready(cx).map_err(crate::error::request),
-            HyperClient::NonTor(client) => client.poll_ready(cx).map_err(crate::error::request),
-        }
+        self.hyper.poll_ready(cx)
     }
 
     #[cfg(not(feature = "cookies"))]
     fn call(&mut self, req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
         let clone = self.hyper.clone();
         let mut inner = std::mem::replace(&mut self.hyper, clone);
-        Box::pin(async move {
-            match &mut inner {
-                #[cfg(feature = "tor")]
-                HyperClient::Tor(client) => client.call(req).await.map_err(crate::error::request),
-                HyperClient::NonTor(client) => {
-                    client.call(req).await.map_err(crate::error::request)
-                }
-            }
-        })
+        Box::pin(async move { inner.call(req).await })
     }
 
     #[cfg(feature = "cookies")]
@@ -1020,28 +1049,36 @@ impl ClientBuilder {
 
         #[cfg(feature = "tor")]
         let hyper_client = match self.tor {
-            Some(tor) => HyperClient::Tor(builder.build(ArtiHttpConnector::new(
-                tor,
-                match connector_builder.inner {
-                    #[cfg(not(feature = "__tls"))]
-                    crate::connect::Inner::Http(_) => crate::arti::Tls::Http,
-                    #[cfg(feature = "__rustls")]
-                    crate::connect::Inner::RustlsTls { tls, .. } => {
-                        crate::arti::Tls::RustlsTls { tls }
-                    }
-                    #[cfg(feature = "default-tls")]
-                    crate::connect::Inner::DefaultTls(_, tls_connector) => {
-                        crate::arti::Tls::DefaultTls(tls_connector)
-                    }
-                },
-            ))),
+            Some(tor) => {
+                let v = builder.build(ArtiHttpConnector::new(
+                    tor,
+                    match connector_builder.inner {
+                        #[cfg(not(feature = "__tls"))]
+                        crate::connect::Inner::Http(_) => crate::arti::Tls::Http,
+                        #[cfg(feature = "__rustls")]
+                        crate::connect::Inner::RustlsTls { tls, .. } => {
+                            crate::arti::Tls::RustlsTls { tls }
+                        }
+                        #[cfg(feature = "default-tls")]
+                        crate::connect::Inner::DefaultTls(_, tls_connector) => {
+                            crate::arti::Tls::DefaultTls(tls_connector)
+                        }
+                    },
+                ));
+
+                Box::new(crate::arti::TorHyperClient(v)) as Box<dyn HyperClient>
+            }
             None => {
-                HyperClient::NonTor(builder.build(connector_builder.build(config.connector_layers)))
+                let v: hyper_util::client::legacy::Client<Connector, Body> =
+                    builder.build(connector_builder.build(config.connector_layers));
+                Box::new(NonTorHyperClient(v)) as Box<dyn HyperClient>
             }
         };
         #[cfg(not(feature = "tor"))]
         let hyper_client = {
-            HyperClient::NonTor(builder.build(connector_builder.build(config.connector_layers)))
+            let v: hyper_util::client::legacy::Client<Connector, Body> =
+                builder.build(connector_builder.build(config.connector_layers));
+            Box::new(NonTorHyperClient(v)) as Box<dyn HyperClient>
         };
 
         let hyper_service = HyperService {
